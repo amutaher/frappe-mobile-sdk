@@ -1,0 +1,117 @@
+
+name: Build ERPNext Mobile APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: "ERPNext site HTTPS URL"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.9'
+          channel: stable
+          cache: true
+
+      - name: Configure ERPNext connection
+        working-directory: example
+        env:
+          SITE_URL: ${{ inputs.site_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from urllib.parse import urlparse
+          import json
+
+          url = os.environ["SITE_URL"].strip().rstrip("/") + "/"
+          parsed = urlparse(url)
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit("A valid HTTPS site URL is required")
+
+          template = Path("lib/config/app_config.example.dart")
+          config = template.read_text()
+
+          config = config.replace(
+              "'https://your-site.com/'",
+              json.dumps(url)
+          )
+          config = config.replace(
+              "com.example.frappe_mobile_sdk_demo",
+              "com.example.frappe_mobile_sdk_example"
+          )
+
+          Path("lib/config/app_config.dart").write_text(config)
+
+          main = Path("lib/main.dart")
+          content = main.read_text()
+          content = content.replace(
+              "enableOAuth: true,",
+              "enableOAuth: false,"
+          )
+          main.write_text(content)
+          PY
+
+      - name: Generate Android project
+        working-directory: example
+        run: |
+          flutter create --platforms=android \
+            --org com.example \
+            --project-name frappe_mobile_sdk_example .
+          git restore .metadata
+
+      - name: Add Internet permission
+        working-directory: example
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path(
+              "android/app/src/main/AndroidManifest.xml"
+          )
+          content = manifest.read_text()
+          permission = (
+              '    <uses-permission '
+              'android:name="android.permission.INTERNET" />\n'
+          )
+          content = content.replace(
+              "<application", permission + "    <application", 1
+          )
+          manifest.write_text(content)
+          PY
+
+      - name: Install dependencies
+        working-directory: example
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: example
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ERPNext-Mobile-Android-APK
+          path: example/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+          if-no-files-found: error
