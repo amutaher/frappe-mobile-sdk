@@ -1,0 +1,177 @@
+# Codemagic build workflow for dhwani-ris/frappe-mobile-sdk (develop branch).
+# Add this file at the ROOT of your fork, not inside example/.
+# Run manually to avoid consuming free minutes on every Git push.
+workflows:
+  frappe-mobile-android:
+    name: ERPNext Mobile Android Test APK
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+
+    inputs:
+      site_url:
+        description: "HTTPS URL of your ERPNext/Frappe v15 TEST site (e.g. https://erp-test.example.com/)"
+        type: string
+      app_name:
+        description: "Display name shown in Android and in the Flutter app"
+        type: string
+        default: "ERPNext Mobile Test"
+
+    environment:
+      flutter: 3.38.9
+      java: 17
+      vars:
+        FRAPPE_SITE_URL: ${{ inputs.site_url }}
+        APP_NAME: ${{ inputs.app_name }}
+        APP_VERSION: "1.0.1"
+
+    cache:
+      cache_paths:
+        - $HOME/.pub-cache
+        - $HOME/.gradle/caches
+
+    scripts:
+      - name: Generate Flutter app configuration
+        script: |
+          set -eu
+          cd "$CM_BUILD_DIR/example"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          url = os.environ.get("FRAPPE_SITE_URL", "").strip()
+          parsed = urlsplit(url)
+          if (parsed.scheme != "https" or not parsed.hostname
+              or parsed.username or parsed.password
+              or parsed.path not in ("", "/")
+              or parsed.query or parsed.fragment):
+              raise SystemExit("Enter an HTTPS ERPNext site root URL without a path or credentials")
+          url = url.rstrip("/") + "/"
+          app_name = os.environ.get("APP_NAME", "").strip()
+          version = os.environ.get("APP_VERSION", "").strip()
+          if not app_name:
+              raise SystemExit("APP_NAME cannot be empty")
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              raise SystemExit("APP_VERSION must be semantic version x.y.z")
+
+          values = {
+              "appName": app_name,
+              "appVersion": version,
+              # Keep app ID from the previous GitHub Actions test APK:
+              "packageName": "com.example.frappe_mobile_sdk_example",
+              "baseUrl": url,
+              "oauthClientId": "",
+              "oauthClientSecret": "",
+              "homeScreenLayout": "list",
+              "documentListLayout": "list",
+              "formStylePreset": "standard",
+              "formTabHeaderLayout": "tabbar",
+          }
+          template_path = Path("lib/config/app_config.example.dart")
+          data = template_path.read_text(encoding="utf-8")
+          for key, val in values.items():
+              pattern = rf"(static const String {re.escape(key)}\s*=\s*)([^;]*)(;)"
+              data, n = re.subn(pattern,
+                  lambda m: m.group(1) + json.dumps(val, ensure_ascii=False) + m.group(3),
+                  data, count=1)
+              if n != 1:
+                  raise SystemExit(f"SDK template changed: cannot find {key}")
+          Path("lib/config/app_config.dart").write_text(data, encoding="utf-8")
+
+          main_path = Path("lib/main.dart")
+          main = main_path.read_text(encoding="utf-8")
+          if "enableOAuth: true," not in main:
+              raise SystemExit("SDK example changed: review its OAuth configuration")
+          main = main.replace("enableOAuth: true,", "enableOAuth: false,", 1)
+          main_path.write_text(main, encoding="utf-8")
+          print(f"Configured test app: {app_name} ({version}) -> {url}")
+          PY
+
+      - name: Generate Android project (excluded from SDK Git)
+        script: |
+          set -eu
+          cd "$CM_BUILD_DIR/example"
+          flutter create --platforms=android --org com.example --project-name frappe_mobile_sdk_example .
+          git restore .metadata || true
+
+      - name: Fix GPS/Internet manifest permissions and Android label
+        script: |
+          set -eu
+          cd "$CM_BUILD_DIR/example"
+          python3 - <<'PY'
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          from xml.sax.saxutils import quoteattr
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          xml = path.read_text(encoding="utf-8")
+          permissions = [
+              "android.permission.INTERNET",
+              "android.permission.ACCESS_FINE_LOCATION",
+              "android.permission.ACCESS_COARSE_LOCATION",
+          ]
+          missing = [p for p in permissions if f'android:name="{p}"' not in xml]
+          if "    <application" not in xml:
+              raise SystemExit("AndroidManifest.xml structure changed")
+          additions = "".join(
+              f'    <uses-permission android:name="{p}" />\n' for p in missing
+          )
+          xml = xml.replace("    <application", additions + "    <application", 1)
+          xml, count = re.subn(
+              r'android:label="[^"]*"',
+              'android:label=' + quoteattr(os.environ["APP_NAME"]),
+              xml, count=1,
+          )
+          if count != 1:
+              raise SystemExit("Android application label not found")
+          path.write_text(xml, encoding="utf-8")
+
+          root = ET.parse(path).getroot()
+          ns = "{http://schemas.android.com/apk/res/android}name"
+          actual = {e.get(ns) for e in root.findall("uses-permission")}
+          assert set(permissions).issubset(actual), "Required permissions are missing"
+
+          gradle = Path("android/app/build.gradle.kts").read_text(encoding="utf-8")
+          if 'applicationId = "com.example.frappe_mobile_sdk_example"' not in gradle:
+              raise SystemExit("Generated Android applicationId differs from Mobile Configuration")
+          print("Manifest validated: Internet + fine and coarse foreground location")
+          PY
+
+      - name: Resolve Flutter dependencies and analyze
+        script: |
+          set -eu
+          cd "$CM_BUILD_DIR/example"
+          flutter --version
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build Android test APK
+        script: |
+          set -eu
+          cd "$CM_BUILD_DIR/example"
+          flutter build apk --release --build-name="$APP_VERSION" --build-number="${PROJECT_BUILD_NUMBER:-1}"
+
+      - name: Check compiled APK permissions
+        script: |
+          set -eu
+          APK="$CM_BUILD_DIR/example/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          AAPT=$(find "$ANDROID_SDK_ROOT/build-tools" -maxdepth 2 -type f -name aapt | sort | tail -n 1)
+          if [ -n "$AAPT" ]; then
+            "$AAPT" dump permissions "$APK" > "$CM_BUILD_DIR/apk-permissions.txt"
+            grep -q 'android.permission.ACCESS_FINE_LOCATION' "$CM_BUILD_DIR/apk-permissions.txt"
+            grep -q 'android.permission.ACCESS_COARSE_LOCATION' "$CM_BUILD_DIR/apk-permissions.txt"
+            grep -q 'android.permission.INTERNET' "$CM_BUILD_DIR/apk-permissions.txt"
+            cat "$CM_BUILD_DIR/apk-permissions.txt"
+          else
+            echo "Warning: aapt not found; validated source AndroidManifest.xml only"
+          fi
+          ls -lh "$APK"
+
+    artifacts:
+      - example/build/app/outputs/flutter-apk/*.apk
+      - apk-permissions.txt
